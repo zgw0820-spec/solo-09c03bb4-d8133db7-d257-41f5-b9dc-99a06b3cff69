@@ -14,6 +14,7 @@ from app.db import init_db
 from app.features import normalise
 from app.lease import LeaseLost
 from app.model import batch_loss, sgd_step
+from app.store import JobAlreadyCompleted, JobCancelled, JobNotFound
 
 
 def make_settings(tmp_path, **overrides) -> Settings:
@@ -272,3 +273,123 @@ def test_reacquired_lease_never_reuses_an_epoch(settings):
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 0
     store.advance_job(settings.db_path, second)
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 1
+
+
+def test_cancel_queued_job_is_terminal_and_idempotent(settings):
+    features, labels = sample(8)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    result = store.cancel_job(settings.db_path, job["job_id"], "bad labels")
+    assert result["status"] == "cancelled"
+    assert result["already_cancelled"] is False
+    assert result["cancel_reason"] == "bad labels"
+    assert result["completed_steps"] == 0
+
+    repeat = store.cancel_job(settings.db_path, job["job_id"], "another reason")
+    assert repeat["already_cancelled"] is True
+    assert repeat["status"] == "cancelled"
+    # The first cancellation's terminal state is preserved exactly.
+    assert repeat["cancel_reason"] == "bad labels"
+    assert repeat["finished_at"] == result["finished_at"]
+    assert repeat["updated_at"] == result["updated_at"]
+
+    with pytest.raises(JobNotFound):
+        store.cancel_job(settings.db_path, "no-such-job")
+
+    events = store.list_events(settings.db_path, job["job_id"])
+    cancels = [e for e in events if e["event"] == "job_cancelled"]
+    assert len(cancels) == 1
+    assert store.claimable_jobs(settings.db_path) == []
+
+
+def test_cancel_running_job_freezes_progress_weights_and_loss(settings):
+    features, labels = sample(16, seed=4)
+    job = store.create_job(settings.db_path, features, labels, 3)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w", settings.lease_seconds)
+    for _ in range(2):
+        store.advance_job(settings.db_path, lease)
+    snapshot = store.get_job(settings.db_path, job["job_id"])
+    checkpoints_before = store.list_checkpoints(settings.db_path, job["job_id"])
+
+    result = store.cancel_job(settings.db_path, job["job_id"])
+    assert result["status"] == "cancelled"
+    assert result["completed_steps"] == snapshot["completed_steps"] == 2
+    assert result["weights"] == snapshot["weights"]
+    assert result["momentum_velocity"] == snapshot["momentum_velocity"]
+    assert result["loss"] == snapshot["loss"]
+    assert result["progress"] == snapshot["progress"]
+    assert result["final_weights"] is None
+
+    # Confirmed checkpoints survive for investigation; nothing new appears.
+    checkpoints_after = store.list_checkpoints(settings.db_path, job["job_id"])
+    assert checkpoints_after == checkpoints_before
+    # The lease is released inside the cancel transaction.
+    assert lm.holder(settings.db_path, job["job_id"]) is None
+    assert store.claimable_jobs(settings.db_path) == []
+
+
+def test_late_worker_cannot_commit_or_restart_a_cancelled_job(settings):
+    features, labels = sample(20, seed=8)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "old")
+    old = lm.acquire(settings.db_path, job["job_id"], "old", settings.lease_seconds)
+    store.advance_job(settings.db_path, old)
+    snapshot = store.get_job(settings.db_path, job["job_id"])
+
+    store.cancel_job(settings.db_path, job["job_id"])
+
+    # The original holder's next commit must be refused.
+    with pytest.raises(JobCancelled):
+        store.advance_job(settings.db_path, old)
+
+    # Even after the old lease would have expired, nobody can re-acquire it.
+    time.sleep(settings.lease_seconds + 0.05)
+    lm.register_worker(settings.db_path, "new")
+    assert (
+        lm.acquire(settings.db_path, job["job_id"], "new", settings.lease_seconds)
+        is None
+    )
+    frozen = store.get_job(settings.db_path, job["job_id"])
+    assert frozen["status"] == "cancelled"
+    assert frozen["completed_steps"] == snapshot["completed_steps"]
+    assert frozen["weights"] == snapshot["weights"]
+    steps = [c["step"] for c in store.list_checkpoints(settings.db_path, job["job_id"])]
+    assert steps == [1]
+
+
+def test_cancel_and_completion_interleave_to_one_terminal_state(settings):
+    features, labels = sample(8, seed=2)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w", settings.lease_seconds)
+
+    # Complete first: cancel must be refused and the job stays completed.
+    while store.advance_job(settings.db_path, lease)["status"] != "completed":
+        pass
+    with pytest.raises(JobAlreadyCompleted):
+        store.cancel_job(settings.db_path, job["job_id"])
+    final = store.get_job(settings.db_path, job["job_id"])
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"]
+
+
+def test_other_jobs_still_claimable_after_a_cancellation(settings):
+    features, labels = sample(16, seed=5)
+    cancelled_job = store.create_job(settings.db_path, features, labels, 2)
+    other_job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "w")
+    lease = lm.acquire(
+        settings.db_path, cancelled_job["job_id"], "w", settings.lease_seconds
+    )
+    store.advance_job(settings.db_path, lease)
+    store.cancel_job(settings.db_path, cancelled_job["job_id"])
+
+    claimable = store.claimable_jobs(settings.db_path)
+    assert claimable == [other_job["job_id"]]
+    new_lease = lm.acquire(
+        settings.db_path, other_job["job_id"], "w", settings.lease_seconds
+    )
+    assert new_lease is not None and new_lease.job_id == other_job["job_id"]
+    result = store.advance_job(settings.db_path, new_lease)
+    assert result["step"] == 1
+    assert store.get_job(settings.db_path, other_job["job_id"])["status"] == "running"

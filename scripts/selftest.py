@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -85,6 +86,20 @@ def post(port: int, path: str, body: dict):
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read())
+
+
+def _request(port: int, method: str, path: str, body: dict | None = None):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
 
 
 def wait_for(predicate, timeout: float, message: str):
@@ -271,6 +286,83 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_cancellation(tmp: Path) -> bool:
+    """Cancel a running job over HTTP and verify every terminal guarantee."""
+    db = tmp / "cancel.db"
+    pause = tmp / "cancel-pause"
+    api, port = start_api(db)
+    job = post(port, "/jobs", dataset(seed=11, records=32))
+    worker_a = start_worker(db, "worker-a", TRAINING_DEMO_PAUSE_FILE=str(pause))
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{job['job_id']}")["completed_steps"] >= 2,
+            60,
+            "cancel target progress",
+        )
+        pause.write_text("pause")
+        wait_for(
+            lambda: get(port, "/workers")["leases"][0]["expired"],
+            30,
+            "holder lease expiry",
+        )
+        frozen = get(port, f"/jobs/{job['job_id']}")
+        checkpoints_before = get(port, f"/jobs/{job['job_id']}/checkpoints")
+
+        status, body = _request(
+            port, "POST", f"/jobs/{job['job_id']}/cancel", {"reason": "bad labels"}
+        )
+        assert status == 200 and body["status"] == "cancelled", (status, body)
+        assert body["already_cancelled"] is False
+        assert body["completed_steps"] == frozen["completed_steps"]
+        assert body["weights"] == frozen["weights"]
+        assert body["loss"] == frozen["loss"]
+
+        # Repeated cancellation returns the same terminal result.
+        status, repeat = _request(
+            port, "POST", f"/jobs/{job['job_id']}/cancel", {"reason": "again"}
+        )
+        assert status == 200 and repeat["already_cancelled"] is True
+        assert repeat["finished_at"] == body["finished_at"]
+        assert repeat["cancel_reason"] == "bad labels"
+
+        # The frozen worker wakes up, must not write, and the lease is gone.
+        pause.unlink()
+        time.sleep(DELAY * 6)
+        after = get(port, f"/jobs/{job['job_id']}")
+        assert after["status"] == "cancelled"
+        assert after["completed_steps"] == frozen["completed_steps"]
+        assert after["weights"] == frozen["weights"]
+        assert get(port, f"/jobs/{job['job_id']}/checkpoints") == checkpoints_before
+        assert get(port, "/workers")["leases"] == []
+        events = get(port, f"/jobs/{job['job_id']}/events")
+        assert any(e["event"] == "job_cancelled" for e in events)
+        assert any(e["event"] == "training_aborted" for e in events)
+
+        # Another worker cannot resume the cancelled job, but does take the
+        # next queued job - takeover/resume for other jobs stays available.
+        worker_b = start_worker(db, "worker-b")
+        try:
+            queued = post(port, "/jobs", dataset(seed=12, records=24))
+            final = completed_state(port, queued["job_id"])
+            assert final["status"] == "completed"
+            assert get(port, f"/jobs/{job['job_id']}")["status"] == "cancelled"
+            status, conflict = _request(
+                port, "POST", f"/jobs/{queued['job_id']}/cancel", {"reason": "late"}
+            )
+            assert status == 409, conflict
+        finally:
+            stop(worker_b)
+    finally:
+        stop(worker_a)
+        pause.unlink(missing_ok=True)
+        stop(api)
+    print(
+        f"  PASS: cancelled at step {frozen['completed_steps']} stayed frozen,"
+        " idempotent, lease released, other job still trained to completion"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +371,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("cancellation", lambda: check_cancellation(tmp)),
         ):
             print(f"[{name}]")
             try:

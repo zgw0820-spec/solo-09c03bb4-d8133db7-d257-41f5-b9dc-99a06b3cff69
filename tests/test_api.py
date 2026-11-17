@@ -115,3 +115,116 @@ def test_workers_endpoint_empty(client):
     assert "lease_seconds" in data
     assert data["workers"] == []
     assert data["leases"] == []
+
+
+def test_cancel_endpoint_in_swagger(client):
+    schema = client.get("/openapi.json").json()
+    assert "/jobs/{job_id}/cancel" in schema["paths"]
+    assert "post" in schema["paths"]["/jobs/{job_id}/cancel"]
+
+
+def test_cancel_queued_job_freezes_it_and_is_idempotent(client):
+    job = client.post("/jobs", json=payload(12, 3)).json()
+    response = client.post(
+        f"/jobs/{job['job_id']}/cancel", json={"reason": "wrong labels"}
+    )
+    assert response.status_code == 200
+    cancelled = response.json()
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["already_cancelled"] is False
+    assert cancelled["cancel_reason"] == "wrong labels"
+    assert cancelled["completed_steps"] == 0
+    assert cancelled["progress"] == 0.0
+    assert cancelled["final_weights"] is None
+    assert cancelled["cancelled_at"] == cancelled["finished_at"]
+
+    # Repeated cancellation keeps the original terminal result.
+    again = client.post(
+        f"/jobs/{job['job_id']}/cancel", json={"reason": "different reason"}
+    ).json()
+    assert again["already_cancelled"] is True
+    assert again["status"] == "cancelled"
+    assert again["cancel_reason"] == "wrong labels"
+    assert again["finished_at"] == cancelled["finished_at"]
+    assert again["updated_at"] == cancelled["updated_at"]
+
+    current = client.get(f"/jobs/{job['job_id']}").json()
+    assert current["status"] == "cancelled"
+    assert current["cancel_reason"] == "wrong labels"
+    assert client.get(f"/jobs/{job['job_id']}/checkpoints").json() == []
+    events = client.get(f"/jobs/{job['job_id']}/events").json()
+    cancel_events = [e for e in events if e["event"] == "job_cancelled"]
+    assert len(cancel_events) == 1
+    assert cancel_events[0]["detail"]["reason"] == "wrong labels"
+    assert cancel_events[0]["detail"]["completed_steps"] == 0
+
+
+def test_cancel_without_body_uses_none_reason(client):
+    job = client.post("/jobs", json=payload(8, 2)).json()
+    response = client.post(f"/jobs/{job['job_id']}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["cancel_reason"] is None
+
+
+def test_cancel_running_job_keeps_last_checkpoint_and_releases_lease(client):
+    from app import lease as lm
+    from app import store
+
+    job = client.post("/jobs", json=payload(16, 2)).json()
+    settings = Settings.from_env()
+    lm.register_worker(settings.db_path, "w1")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w1", settings.lease_seconds)
+    store.advance_job(settings.db_path, lease)
+    snapshot = client.get(f"/jobs/{job['job_id']}").json()
+
+    response = client.post(f"/jobs/{job['job_id']}/cancel", json={"reason": "bad"})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "cancelled"
+    assert result["completed_steps"] == snapshot["completed_steps"] == 1
+    assert result["weights"] == snapshot["weights"]
+    assert result["loss"] == snapshot["loss"]
+    assert result["momentum_velocity"] == snapshot["momentum_velocity"]
+
+    # The confirmed checkpoint is retained for investigation.
+    checkpoints = client.get(f"/jobs/{job['job_id']}/checkpoints").json()
+    assert [c["step"] for c in checkpoints] == [1]
+
+    # The lease row is gone; workers must not show this job as leased.
+    workers = client.get("/workers").json()
+    assert workers["leases"] == []
+
+
+def test_cancel_completed_job_is_refused(client):
+    from app import lease as lm
+    from app import store
+
+    job = client.post("/jobs", json=payload(8, 2)).json()
+    settings = Settings.from_env()
+    lm.register_worker(settings.db_path, "w1")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w1", settings.lease_seconds)
+    while store.advance_job(settings.db_path, lease)["status"] != "completed":
+        pass
+
+    response = client.post(f"/jobs/{job['job_id']}/cancel", json={"reason": "late"})
+    assert response.status_code == 409
+    current = client.get(f"/jobs/{job['job_id']}").json()
+    assert current["status"] == "completed"
+    assert current["final_weights"] is not None
+    events = client.get(f"/jobs/{job['job_id']}/events").json()
+    assert all(e["event"] != "job_cancelled" for e in events)
+
+
+def test_cancel_unknown_job_returns_404(client):
+    response = client.post("/jobs/nope/cancel", json={"reason": "x"})
+    assert response.status_code == 404
+
+
+def test_cancelled_job_is_not_claimable(client):
+    from app import store
+
+    settings = Settings.from_env()
+    job = client.post("/jobs", json=payload(8, 2)).json()
+    client.post(f"/jobs/{job['job_id']}/cancel", json={"reason": "x"})
+    assert store.claimable_jobs(settings.db_path) == []

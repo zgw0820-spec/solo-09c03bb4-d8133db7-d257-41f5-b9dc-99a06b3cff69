@@ -36,11 +36,15 @@ from .features import (
 from .lease import Lease, LeaseLost, owner_ok
 from .model import dataset_loss, sgd_step
 
-JOB_STATUSES = ("queued", "running", "completed")
+JOB_STATUSES = ("queued", "running", "completed", "cancelled")
 
 
 class JobNotFound(LookupError):
     pass
+
+
+class JobCancelled(RuntimeError):
+    """The job was cancelled; this worker must stop training it."""
 
 
 class StateConflict(RuntimeError):
@@ -181,6 +185,7 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "finished_at": row["finished_at"],
+        "cancel_reason": row["cancel_reason"] if "cancel_reason" in row.keys() else None,
     }
 
 
@@ -264,6 +269,76 @@ def claimable_jobs(db_path, limit: int = 20) -> list[str]:
     return [row["job_id"] for row in rows]
 
 
+def cancel_job(db_path, job_id: str, reason: str | None = None) -> dict[str, Any]:
+    """Cancel a queued or running job in one write transaction.
+
+    Terminal semantics, all decided while holding the SQLite write lock:
+
+    * a ``completed`` job is terminal and refuses cancellation (the caller
+      gets :class:`JobAlreadyCompleted`);
+    * a first successful cancellation flips the job to ``cancelled``, records
+      the confirmed step, frees the lease and writes a ``job_cancelled`` audit
+      event;
+    * a repeated cancellation of the same job returns the unchanged terminal
+      state without writing anything, so the result is idempotent;
+    * a worker racing the commit can never flip the job back to ``running``:
+      the conditional ``UPDATE`` in :func:`advance_job` only matches
+      ``queued``/``running`` rows, and the lease fence fails because the lease
+      row is deleted here.
+
+    Confirmed checkpoints, weights, momentum and loss are deliberately left
+    untouched so the last confirmed breakpoint stays available for
+    investigation.
+    """
+    with transaction(db_path) as conn:
+        row = _job_row(conn, job_id)
+        if row is None:
+            raise JobNotFound(job_id)
+        if row["status"] == "completed":
+            raise JobAlreadyCompleted(job_id)
+        if row["status"] == "cancelled":
+            # Idempotent terminal read: repeat calls keep the original result.
+            cancelled_at = row["finished_at"]
+            already = True
+        else:
+            now = time.time()
+            updated = conn.execute(
+                """
+                UPDATE jobs
+                   SET status='cancelled', cancel_reason=?, updated_at=?, finished_at=?
+                 WHERE job_id=? AND status IN ('queued','running')
+                """,
+                (reason, now, now, job_id),
+            )
+            if updated.rowcount != 1:
+                raise StateConflict("job status changed during an exclusive transaction")
+            # Free the lease inside the same transaction.  Any worker holding
+            # the old (worker_id, epoch) fence now fails owner_ok, and the
+            # monotonic lease_epochs counter guarantees a re-acquired lease
+            # can never reuse the stale epoch.
+            conn.execute("DELETE FROM leases WHERE job_id=?", (job_id,))
+            _event(
+                conn,
+                job_id,
+                "job_cancelled",
+                {
+                    "completed_steps": int(row["completed_steps"]),
+                    "reason": reason,
+                },
+            )
+            cancelled_at = now
+            already = False
+    job = get_job(db_path, job_id)
+    assert job is not None
+    job["already_cancelled"] = already
+    job["cancelled_at"] = cancelled_at
+    return job
+
+
+class JobAlreadyCompleted(RuntimeError):
+    """Cancellation was refused because the job already reached completion."""
+
+
 def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, Any]:
     """Commit exactly one batch for ``lease``'s job.
 
@@ -275,14 +350,18 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
     if batch_delay > 0:
         time.sleep(batch_delay)
     with transaction(db_path) as conn:
+        row = _job_row(conn, lease.job_id)
+        if row is None:
+            raise JobNotFound(lease.job_id)
+        if row["status"] == "cancelled":
+            # Terminal guard before the fence: neither the current holder nor a
+            # late worker may add checkpoints to a cancelled job.
+            raise JobCancelled(f"job {lease.job_id} was cancelled")
         if not owner_ok(conn, lease):
             raise LeaseLost(
                 f"job {lease.job_id} is no longer owned by {lease.worker_id}@{lease.epoch}"
             )
 
-        row = _job_row(conn, lease.job_id)
-        if row is None:
-            raise JobNotFound(lease.job_id)
         if row["status"] == "completed":
             return {
                 "status": "completed",

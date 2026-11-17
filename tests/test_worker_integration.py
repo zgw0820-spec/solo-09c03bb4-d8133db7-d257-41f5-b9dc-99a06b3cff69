@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -112,6 +113,20 @@ class Server:
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read())
+
+    def request(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
 
 
 def start_worker(db: Path, worker_id: str, **env: str) -> subprocess.Popen:
@@ -283,3 +298,115 @@ def test_late_worker_cannot_regress_or_false_complete(tmp_path):
         finally:
             stop_worker(worker_a)
             stop_worker(worker_b)
+
+
+def test_cancel_survives_worker_and_api_restarts_and_other_job_keeps_training(tmp_path):
+    """Cancellation is durable and failover for other jobs still works.
+
+    1. worker-a trains job A and job B is queued;
+    2. cancel A over HTTP while it is running;
+    3. kill worker-a and restart the API (new process, same SQLite file);
+    4. worker-b must never resume A, but completes B;
+    5. A's frozen checkpoint/weights/loss are unchanged and a second cancel
+       returns the same terminal state, while cancelling a completed job is
+       refused with 409.
+    """
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        job_a = server.post("/jobs", dataset(records=32, seed=31))
+        worker_a = start_worker(db, "worker-a")
+        try:
+            wait_for(
+                lambda: server.get(f"/jobs/{job_a['job_id']}")["completed_steps"] >= 2,
+                timeout=60,
+                message="job A first batches",
+            )
+        finally:
+            stop_worker(worker_a, hard=True)
+
+        frozen = server.get(f"/jobs/{job_a['job_id']}")
+        assert frozen["status"] == "running"
+        status, body = server.request(
+            "POST", f"/jobs/{job_a['job_id']}/cancel", {"reason": "wrong labels"}
+        )
+        assert status == 200
+        assert body["status"] == "cancelled"
+        assert body["already_cancelled"] is False
+        assert body["completed_steps"] == frozen["completed_steps"]
+        assert body["weights"] == frozen["weights"]
+        checkpoints_at_cancel = server.get(f"/jobs/{job_a['job_id']}/checkpoints")
+
+        # A queued job must still be picked up by the remaining worker.
+        job_b = server.post("/jobs", dataset(records=24, seed=32))
+
+    # API restart: a brand-new process against the same SQLite database.
+    with Server(db, free_port()) as restarted:
+        worker_b = start_worker(db, "worker-b")
+        try:
+            final_b = wait_completed(restarted, job_b["job_id"])
+
+            # Give worker-b plenty of polls; it must never claim job A.
+            time.sleep(BATCH_DELAY * 4)
+            state_a = restarted.get(f"/jobs/{job_a['job_id']}")
+            assert state_a["status"] == "cancelled"
+            assert state_a["completed_steps"] == frozen["completed_steps"]
+            assert state_a["weights"] == frozen["weights"]
+            assert state_a["loss"] == frozen["loss"]
+            assert state_a["momentum_velocity"] == frozen["momentum_velocity"]
+            assert state_a["cancel_reason"] == "wrong labels"
+            checkpoints_now = restarted.get(f"/jobs/{job_a['job_id']}/checkpoints")
+            assert checkpoints_now == checkpoints_at_cancel
+            assert restarted.get("/workers")["leases"] == []
+
+            # Repeated cancel is idempotent across the restart.
+            status, repeat = restarted.request(
+                "POST", f"/jobs/{job_a['job_id']}/cancel", {"reason": "again"}
+            )
+            assert status == 200
+            assert repeat["already_cancelled"] is True
+            assert repeat["cancel_reason"] == "wrong labels"
+            assert repeat["finished_at"] == state_a["finished_at"]
+
+            # A completed job refuses cancellation with a deterministic 409.
+            status, conflict = restarted.request(
+                "POST", f"/jobs/{job_b['job_id']}/cancel", {"reason": "late"}
+            )
+            assert status == 409
+            assert "completed" in conflict["detail"]
+            assert (
+                restarted.get(f"/jobs/{job_b['job_id']}")["status"] == "completed"
+            )
+            assert final_b["completed_steps"] == final_b["total_steps"]
+
+            events = restarted.get(f"/jobs/{job_a['job_id']}/events")
+            assert any(e["event"] == "job_cancelled" for e in events)
+        finally:
+            stop_worker(worker_b)
+
+
+def test_cancel_queued_job_over_http_is_never_trained(tmp_path):
+    db = tmp_path / "training.db"
+    with Server(db, free_port()) as server:
+        worker = start_worker(db, "worker-a")
+        try:
+            # Occupy the worker with a long first job so the second stays queued.
+            running = server.post("/jobs", dataset(records=40, seed=41))
+            queued = server.post("/jobs", dataset(records=24, seed=42))
+            wait_for(
+                lambda: server.get(f"/jobs/{running['job_id']}")["status"] == "running",
+                timeout=60,
+                message="first job to start",
+            )
+            status, body = server.request(
+                "POST", f"/jobs/{queued['job_id']}/cancel", {"reason": "withdrawn"}
+            )
+            assert status == 200 and body["status"] == "cancelled"
+
+            wait_completed(server, running["job_id"])
+            time.sleep(BATCH_DELAY * 4)
+            state = server.get(f"/jobs/{queued['job_id']}")
+            assert state["status"] == "cancelled"
+            assert state["completed_steps"] == 0
+            assert server.get(f"/jobs/{queued['job_id']}/checkpoints") == []
+        finally:
+            stop_worker(worker)

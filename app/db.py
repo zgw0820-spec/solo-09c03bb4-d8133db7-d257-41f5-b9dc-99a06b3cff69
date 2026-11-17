@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     completed_steps INTEGER NOT NULL DEFAULT 0,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
-    finished_at     REAL
+    finished_at     REAL,
+    cancel_reason   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -141,5 +142,11 @@ def init_db(path: Path | str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        # Lightweight forward migration for databases created before the
+        # cancellation feature.  SQLite cannot add a NOT NULL column without a
+        # default to an existing table, so the reason stays nullable.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if "cancel_reason" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cancel_reason TEXT")
     finally:
         conn.close()

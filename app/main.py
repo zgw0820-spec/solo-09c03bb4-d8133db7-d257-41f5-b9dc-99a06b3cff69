@@ -30,7 +30,12 @@ app = FastAPI(
         "regression with batch size 8, learning rate 0.1 and momentum 0.9.\n\n"
         "All training is executed by workers. Every batch commits weights, "
         "momentum, loss and progress in one atomic checkpoint; after a failure "
-        "the next worker resumes from the newest committed checkpoint."
+        "the next worker resumes from the newest committed checkpoint.\n\n"
+        "Queued or running jobs can be withdrawn with "
+        "POST /jobs/{job_id}/cancel: the last confirmed checkpoint is retained "
+        "for investigation while progress, weights and loss freeze permanently "
+        "and the worker releases the lease and takes the next job. Completed "
+        "jobs cannot be cancelled (409); repeated cancels are idempotent."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -52,6 +57,18 @@ class TrainingRequest(BaseModel):
         examples=[[0, 0, 1, 1]],
     )
     epochs: int = Field(2, ge=2, le=5, description="Training epochs (2-5).")
+
+
+class CancelRequest(BaseModel):
+    reason: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "Why the training is withdrawn, e.g. wrong sample labels. "
+            "Recorded on the job and in the job_cancelled audit event."
+        ),
+        examples=["wrong labels in submitted batch"],
+    )
 
 
 @app.get("/health", tags=["system"])
@@ -87,6 +104,37 @@ def get_job(job_id: str) -> dict[str, Any]:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+@app.post("/jobs/{job_id}/cancel", tags=["training"])
+def cancel_job(job_id: str, request: CancelRequest | None = None) -> dict[str, Any]:
+    """Withdraw a queued or running job.
+
+    Deterministic terminal semantics:
+
+    * a job that already completed is terminal and the cancel is refused
+      (409);
+    * the first successful cancel returns the frozen job with
+      ``already_cancelled=false``; the last confirmed checkpoint, weights and
+      loss are retained for investigation and never change again;
+    * repeating the cancel returns the same terminal state with
+      ``already_cancelled=true`` and never re-writes it;
+    * the worker's lease is released atomically, so it stops committing
+      checkpoints and takes the next job.  A late worker cannot submit more
+      checkpoints or move the job back to ``running``.
+    """
+    reason = request.reason if request is not None else None
+    try:
+        return store.cancel_job(settings.db_path, job_id, reason)
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+    except store.JobAlreadyCompleted as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="job already completed; completed jobs cannot be cancelled",
+        ) from exc
+    except store.StateConflict as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/jobs/{job_id}/checkpoints", tags=["training"])

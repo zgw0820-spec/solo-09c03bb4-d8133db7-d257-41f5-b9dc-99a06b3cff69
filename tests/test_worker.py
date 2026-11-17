@@ -132,3 +132,87 @@ def test_worker_survives_a_crash_preventing_commit(tmp_path):
     epochs = [c["lease_epoch"] for c in checkpoints]
     assert epochs[:2] == [1, 1]
     assert epochs[2:] == [2] * 7
+
+
+def test_cancel_stops_training_freezes_state_and_worker_takes_next_job(tmp_path):
+    settings = make_settings(tmp_path, batch_delay_seconds=0.05)
+    init_db(settings.db_path)
+    target = store.create_job(settings.db_path, *sample(24, seed=10), 3)
+    other = store.create_job(settings.db_path, *sample(16, seed=11), 2)
+    worker, thread = run_worker(settings, "w1")
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if store.get_job(settings.db_path, target["job_id"])["completed_steps"] >= 2:
+                break
+            time.sleep(0.02)
+        snapshot = store.get_job(settings.db_path, target["job_id"])
+        assert snapshot["status"] == "running"
+
+        result = store.cancel_job(settings.db_path, target["job_id"], "bad labels")
+        assert result["status"] == "cancelled"
+
+        # The released worker picks up the remaining job and completes it.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if store.get_job(settings.db_path, other["job_id"])["status"] == "completed":
+                break
+            time.sleep(0.02)
+
+        # Give the loop a moment in case it tried to touch the cancelled job.
+        time.sleep(0.3)
+        frozen = store.get_job(settings.db_path, target["job_id"])
+        assert frozen["status"] == "cancelled"
+        assert frozen["completed_steps"] == snapshot["completed_steps"]
+        assert frozen["weights"] == snapshot["weights"]
+        assert frozen["loss"] == snapshot["loss"]
+        frozen_steps = [
+            c["step"]
+            for c in store.list_checkpoints(settings.db_path, target["job_id"])
+        ]
+        assert frozen_steps == list(range(1, snapshot["completed_steps"] + 1))
+        assert lm.holder(settings.db_path, target["job_id"]) is None
+
+        other_final = store.get_job(settings.db_path, other["job_id"])
+        assert other_final["status"] == "completed"
+        assert other_final["completed_steps"] == other_final["total_steps"]
+
+        events = store.list_events(settings.db_path, target["job_id"])
+        names = [e["event"] for e in events]
+        assert "job_cancelled" in names and "training_aborted" in names
+        aborted = next(e for e in events if e["event"] == "training_aborted")
+        assert aborted["detail"]["reason"] == "cancelled"
+        assert aborted["detail"]["worker_id"] == "w1"
+    finally:
+        stop(worker, thread)
+
+
+def test_cancel_queued_job_never_gets_trained(tmp_path):
+    settings = make_settings(tmp_path)
+    init_db(settings.db_path)
+    worker, thread = run_worker(settings, "w1")
+    try:
+        # Occupy the worker with a first job so the second stays queued.
+        first = store.create_job(settings.db_path, *sample(24, seed=12), 3)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if store.get_job(settings.db_path, first["job_id"])["status"] == "running":
+                break
+            time.sleep(0.02)
+        queued = store.create_job(settings.db_path, *sample(16, seed=13), 2)
+        store.cancel_job(settings.db_path, queued["job_id"], "withdrawn")
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if store.get_job(settings.db_path, first["job_id"])["status"] == "completed":
+                break
+            time.sleep(0.02)
+        time.sleep(0.3)  # let any extra poll happen
+
+        cancelled = store.get_job(settings.db_path, queued["job_id"])
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["completed_steps"] == 0
+        assert store.list_checkpoints(settings.db_path, queued["job_id"]) == []
+        assert lm.holder(settings.db_path, queued["job_id"]) is None
+    finally:
+        stop(worker, thread)

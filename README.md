@@ -1,8 +1,11 @@
-# 风机停机预警训练平台（可续跑）
+# 风机停机预警训练平台（可续跑、可撤销）
 
 用 FastAPI + NumPy + SQLite 实现的风机停机预警逻辑回归训练平台。训练由两个工作器
 容器执行，每个批次都把权重、动量、损失和进度作为**一个原子断点**提交；工作器退出后
 另一个工作器自动接管，并从最近断点继续。最终权重与不中断训练逐位一致。
+
+发现样本标签错误时，可通过 `POST /jobs/{job_id}/cancel` 撤销排队或运行中的任务：
+已确认断点保留供排查，进度/权重/损失永久冻结，工作器释放租约并转去处理下一任务。
 
 ## 组成
 
@@ -42,8 +45,9 @@ docker compose up -d --build
 | `POST` | `/jobs` | 提交 `{"features": [[...]], "labels": [...], "epochs": 3}`，返回 201 与任务 |
 | `GET` | `/jobs` | 最近任务列表 |
 | `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
+| `POST` | `/jobs/{job_id}/cancel` | 撤销排队/运行中的任务（请求体可带 `reason`），冻结终态并释放租约 |
 | `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
-| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
+| `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、撤销、丢失租约 |
 | `GET` | `/workers` | 工作器心跳与租约持有者 |
 | `GET` | `/health` | 健康检查 |
 
@@ -63,6 +67,33 @@ docker compose up -d --build
 4. 完成状态由 `step == total_steps` 在提交事务内一次性置位；旧工作器无法再写入。
 5. SQLite 使用 WAL + `synchronous=FULL`，已提交的断点在进程崩溃/容器重启后仍然存在。
 
+## 撤销（取消）语义
+
+任务状态机为 `queued → running → completed | cancelled`，`completed` 与 `cancelled`
+都是终态。`POST /jobs/{job_id}/cancel` 在一个 `BEGIN IMMEDIATE` 事务内完成所有
+判定与写入，与批次提交、完成提交互斥，因此交错时只有一个确定终态：
+
+1. **已完成则拒绝撤销**：对 `completed` 任务调用返回 `409`，完成结果保持不变。
+2. **首次撤销成功**：任务置为 `cancelled`，写入 `job_cancelled` 审计事件（含当时
+   已确认步数与可选 `reason`），并在同一事务内删除租约行。返回体带
+   `already_cancelled=false`、`cancel_reason`、`cancelled_at`。
+3. **断点保留、状态冻结**：已确认的检查点、权重、动量与损失原样保留用于排查；之后
+   进度、权重与损失不再变化，`final_weights` 始终为 `null`，`GET /jobs/{id}` 与
+   `GET /jobs/{id}/checkpoints` 可随时复盘。
+4. **工作器释放租约并接单**：租约删除后，持有者的下一次续约/提交围栏失败，工作器
+   记录 `training_aborted` 事件、清理本地租约，主循环立即轮询并处理下一任务。
+5. **迟到工作器围栏**：`advance_job` 在事务内先检查 `cancelled` 再校验租约 epoch，
+   迟到或被暂停后唤醒的旧工作器只能得到 `JobCancelled`/`LeaseLost`，无法提交断点，
+   也无法把任务改回 `running`（进度更新的 `WHERE status IN ('queued','running')`
+   条件不再匹配）。
+6. **重复撤销幂等**：对已撤销任务再次调用不写任何数据，返回同一终态且
+   `already_cancelled=true`，首次撤销的 `reason`、`finished_at` 保持不变。
+7. **重启后仍不可续跑**：撤销状态持久化在 SQLite；`lease.acquire` 对
+   `completed/cancelled` 任务一律返回 `None`，工作器故障或 API 重启后都不会接管
+   已撤销任务，而其他任务的接管续训不受影响。
+
+`Swagger`（`/docs`）的 `training` 标签下可直接试用 `POST /jobs/{job_id}/cancel`。
+
 ## 演示与验证
 
 ```bash
@@ -72,7 +103,7 @@ python3 scripts/demo.py
 # 没有 Docker 时用本机进程演示同样流程
 python3 scripts/demo.py --local
 
-# 不依赖 Docker 的三项自检
+# 不依赖 Docker 的四项自检（compose 结构、崩溃接管、迟到围栏、撤销）
 python3 scripts/selftest.py
 
 # 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏）

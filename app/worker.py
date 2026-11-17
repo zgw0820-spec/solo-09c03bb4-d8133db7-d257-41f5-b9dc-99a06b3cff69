@@ -29,6 +29,7 @@ from . import store
 from .config import Settings
 from .db import init_db
 from .lease import Lease, LeaseLost
+from .store import JobCancelled
 
 
 class Worker:
@@ -133,13 +134,29 @@ class Worker:
                     self.lease,
                     self.settings.batch_delay_seconds,
                 )
-            except LeaseLost:
-                print(f"[{self.worker_id}] lost lease on {job_id}; stopping", flush=True)
+            except (LeaseLost, JobCancelled) as exc:
+                reason = "cancelled" if isinstance(exc, JobCancelled) else "lease_lost"
+                # A cancellation deletes the lease and terminates the job; a
+                # lease loss means another owner took over.  Either way this
+                # worker drops the job cleanly and its main loop picks up the
+                # next claimable task.
+                current = store.get_job(self.settings.db_path, job_id)
+                cancelled = current is not None and current["status"] == "cancelled"
+                event = "training_aborted" if cancelled else "lease_lost"
+                print(
+                    f"[{self.worker_id}] {reason} on {job_id}; "
+                    f"releasing and taking the next job",
+                    flush=True,
+                )
                 store.record_event(
                     self.settings.db_path,
                     job_id,
-                    "lease_lost",
-                    {"worker_id": self.worker_id, "lease_epoch": self.lease.epoch},
+                    event,
+                    {
+                        "worker_id": self.worker_id,
+                        "lease_epoch": self.lease.epoch,
+                        "reason": reason,
+                    },
                 )
                 self.lease = None
                 return

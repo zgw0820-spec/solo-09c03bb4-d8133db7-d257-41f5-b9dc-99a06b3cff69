@@ -80,6 +80,13 @@ def acquire(
     """
     now = time.time()
     with transaction(path) as conn:
+        job = conn.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if job is None:
+            return None
+        if job["status"] in ("completed", "cancelled"):
+            # Terminal jobs are never claimable, even with an expired lease:
+            # a restarted worker must not resume a cancelled job.
+            return None
         row = conn.execute("SELECT * FROM leases WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             epoch = _allocate_epoch(conn, job_id)
